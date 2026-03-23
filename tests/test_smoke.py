@@ -5,7 +5,9 @@ These tests verify:
   2. Data loading and pipeline training on **synthetic** UCI HAR-shaped data
      (561 features, 6 classes) — runs offline with no download needed.
   3. Metrics and results files are saved and contain the expected keys.
-  4. (Optional / network) Real dataset download — skipped automatically when
+  4. Deep-learning path: CNN1D forward pass, training, save/load — all on
+     synthetic tensor data (no download needed).
+  5. (Optional / network) Real dataset download — skipped automatically when
      there is no internet access.
 
 Run with:
@@ -22,6 +24,7 @@ from unittest.mock import patch
 
 import numpy as np
 import pytest
+import torch
 
 # Make src/ importable without pip install
 sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
@@ -30,6 +33,15 @@ from ai_har.config import Config, select_dataset
 from ai_har.data import ACTIVITY_LABELS, load_dataset
 from ai_har.evaluate import evaluate_model, save_results
 from ai_har.model import build_model, train
+from ai_har.dl_model import (
+    CNN1D,
+    DLConfig,
+    evaluate_dl,
+    load_dl_model,
+    save_dl_model,
+    save_dl_results,
+    train_dl,
+)
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -39,6 +51,10 @@ N_FEATURES = 561      # UCI HAR feature count
 N_CLASSES = 6         # six activity classes
 N_TRAIN = 300         # synthetic training samples (not the real dataset size)
 N_TEST = 100          # synthetic test samples (not the real dataset size)
+
+# Deep-learning synthetic data dimensions
+N_CHANNELS = 9        # 9 inertial-signal channels (body_acc, body_gyro, total_acc × 3 axes)
+N_TIMESTEPS = 128     # window length used by UCI HAR
 
 
 def _has_internet() -> bool:
@@ -221,3 +237,132 @@ def test_real_dataset_download(tmp_path):
     root = download_and_extract(cfg)
     assert root.exists()
     assert (root / "train" / "X_train.txt").exists()
+
+
+# ---------------------------------------------------------------------------
+# Deep-learning tests — offline, use synthetic tensor data
+# ---------------------------------------------------------------------------
+
+
+def _make_synthetic_sequences(
+    n_samples: int,
+    n_channels: int = N_CHANNELS,
+    n_timesteps: int = N_TIMESTEPS,
+    n_classes: int = N_CLASSES,
+    seed: int = 0,
+) -> tuple:
+    """Return (X, y) with X shape (n_samples, n_channels, n_timesteps)."""
+    rng = np.random.default_rng(seed)
+    X = rng.standard_normal((n_samples, n_channels, n_timesteps)).astype(np.float32)
+    y = rng.integers(0, n_classes, size=n_samples).astype(np.int64)
+    return X, y
+
+
+@pytest.fixture(scope="session")
+def dl_cfg(tmp_path_factory):
+    """DLConfig wired to a temp directory in fast mode with minimal epochs."""
+    base = tmp_path_factory.mktemp("har_dl_smoke")
+    return DLConfig(
+        epochs=2,
+        batch_size=32,
+        lr=1e-3,
+        random_seed=0,
+        data_dir=base / "data",
+        results_dir=base / "results",
+        fast_mode=True,
+        fast_n_samples=200,
+        fast_epochs=2,
+    )
+
+
+@pytest.fixture(scope="session")
+def dl_sequences():
+    """Synthetic (X_train, y_train, X_val, y_val, X_test, y_test) sequences."""
+    X_train, y_train = _make_synthetic_sequences(120, seed=1)
+    X_val, y_val = _make_synthetic_sequences(30, seed=2)
+    X_test, y_test = _make_synthetic_sequences(50, seed=3)
+    return X_train, y_train, X_val, y_val, X_test, y_test
+
+
+@pytest.fixture(scope="session")
+def trained_dl_model(dl_cfg, dl_sequences):
+    """Tiny CNN1D trained for 2 epochs on synthetic sequences."""
+    X_train, y_train, X_val, y_val, *_ = dl_sequences
+    model = CNN1D(n_channels=N_CHANNELS, n_classes=N_CLASSES)
+    return train_dl(model, X_train, y_train, X_val, y_val, dl_cfg)
+
+
+def test_cnn1d_forward_shape():
+    """CNN1D forward pass should produce logits of shape (batch, n_classes)."""
+    model = CNN1D(n_channels=N_CHANNELS, n_classes=N_CLASSES)
+    model.eval()
+    x = torch.zeros(4, N_CHANNELS, N_TIMESTEPS)
+    out = model(x)
+    assert out.shape == (4, N_CLASSES), f"unexpected output shape: {out.shape}"
+
+
+def test_cnn1d_output_is_finite():
+    """CNN1D should not produce NaN or Inf logits on zero input."""
+    model = CNN1D(n_channels=N_CHANNELS, n_classes=N_CLASSES)
+    model.eval()
+    x = torch.zeros(2, N_CHANNELS, N_TIMESTEPS)
+    out = model(x)
+    assert torch.isfinite(out).all(), "CNN1D output contains NaN or Inf"
+
+
+def test_dl_train_completes(trained_dl_model):
+    """train_dl() should return a CNN1D without raising."""
+    assert isinstance(trained_dl_model, CNN1D)
+
+
+def test_dl_predict_shape(trained_dl_model, dl_sequences):
+    """Predictions should match the number of test samples."""
+    *_, X_test, y_test = dl_sequences
+    metrics = evaluate_dl(trained_dl_model, X_test, y_test, split_name="test")
+    cm = np.array(metrics["confusion_matrix"])
+    assert cm.sum() == len(y_test), "confusion matrix total ≠ test set size"
+
+
+def test_dl_accuracy_in_range(trained_dl_model, dl_sequences):
+    """DL model accuracy should be a valid probability (0 ≤ acc ≤ 1)."""
+    *_, X_test, y_test = dl_sequences
+    metrics = evaluate_dl(trained_dl_model, X_test, y_test, split_name="test")
+    assert 0.0 <= metrics["accuracy"] <= 1.0
+
+
+def test_dl_results_saved(dl_cfg, trained_dl_model, dl_sequences):
+    """save_dl_results() should write a valid JSON file with expected keys."""
+    *_, X_test, y_test = dl_sequences
+    metrics = evaluate_dl(trained_dl_model, X_test, y_test, split_name="test")
+    out_path = save_dl_results(metrics, dl_cfg.results_dir, split_name="test")
+    assert out_path.exists()
+    with open(out_path) as f:
+        data = json.load(f)
+    for key in ("accuracy", "confusion_matrix", "classification_report", "class_names"):
+        assert key in data, f"missing key '{key}' in DL results JSON"
+
+
+def test_dl_class_names_in_results(trained_dl_model, dl_sequences):
+    """DL results should include all six activity class names."""
+    *_, X_test, y_test = dl_sequences
+    metrics = evaluate_dl(trained_dl_model, X_test, y_test, split_name="test")
+    assert set(metrics["class_names"]) == set(ACTIVITY_LABELS.values())
+
+
+def test_dl_model_save_load(dl_cfg, trained_dl_model, dl_sequences):
+    """save_dl_model / load_dl_model round-trip should preserve predictions."""
+    *_, X_test, y_test = dl_sequences
+    model_path = dl_cfg.results_dir / "cnn1d_smoke_model.pt"
+    save_dl_model(trained_dl_model, model_path)
+    assert model_path.exists()
+
+    loaded = load_dl_model(model_path, n_channels=N_CHANNELS, n_classes=N_CLASSES)
+
+    # Both models should produce identical predictions on the same input
+    x = torch.from_numpy(X_test[:8])
+    trained_dl_model.eval()
+    loaded.eval()
+    with torch.no_grad():
+        preds_orig = trained_dl_model(x).argmax(dim=1)
+        preds_loaded = loaded(x).argmax(dim=1)
+    assert torch.equal(preds_orig, preds_loaded), "loaded model predictions differ"

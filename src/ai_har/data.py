@@ -2,10 +2,9 @@
 
 from __future__ import annotations
 
-import io
 import zipfile
 from pathlib import Path
-from typing import Tuple
+from typing import List, Tuple
 from urllib.request import urlopen, Request
 
 import numpy as np
@@ -21,6 +20,19 @@ ACTIVITY_LABELS = {
     5: "STANDING",
     6: "LAYING",
 }
+
+# Ordered list of the 9 inertial-signal channel names (3 sensors × 3 axes)
+INERTIAL_SIGNAL_FILES: List[str] = [
+    "body_acc_x",
+    "body_acc_y",
+    "body_acc_z",
+    "body_gyro_x",
+    "body_gyro_y",
+    "body_gyro_z",
+    "total_acc_x",
+    "total_acc_y",
+    "total_acc_z",
+]
 
 
 def _dataset_root(cfg: Config) -> Path:
@@ -126,3 +138,53 @@ def load_dataset(
         f"val: {X_val.shape}, test: {X_test.shape}"
     )
     return X_train, y_train, X_val, y_val, X_test, y_test
+
+
+def load_inertial_signals(
+    cfg: Config,
+    split: str,
+) -> Tuple[np.ndarray, np.ndarray]:
+    """Load raw inertial-signal windows for *split* ('train' or 'test').
+
+    Each UCI HAR window contains 128 consecutive timesteps sampled at 50 Hz
+    from 9 sensor channels (body_acc, body_gyro, total_acc × 3 axes).
+
+    Parameters
+    ----------
+    cfg:
+        Project configuration object.
+    split:
+        Either ``'train'`` or ``'test'``.
+
+    Returns
+    -------
+    X : np.ndarray, shape ``(N, 9, 128)`` — float32
+        9-channel × 128-timestep windows arranged for PyTorch ``Conv1d``
+        (channels-first convention).
+    y : np.ndarray, shape ``(N,)`` — int64
+        0-indexed activity labels (raw 1-indexed values minus 1).
+    """
+    root = _dataset_root(cfg)
+    if not root.exists():
+        download_and_extract(cfg)
+
+    signals_dir = root / split / "Inertial Signals"
+    channels = []
+    for sig_name in INERTIAL_SIGNAL_FILES:
+        path = signals_dir / f"{sig_name}_{split}.txt"
+        if not path.exists():
+            raise FileNotFoundError(
+                f"Inertial signal file not found: '{path}'. "
+                "Ensure the UCI HAR Dataset was fully downloaded and extracted "
+                "with download_and_extract() — the Inertial Signals folder must be present."
+            )
+        arr = np.loadtxt(path)  # shape (N, 128)
+        channels.append(arr)
+
+    # Stack channels: (N, 128) × 9 → (N, 9, 128) via intermediate (N, 128, 9)
+    X = np.stack(channels, axis=-1).transpose(0, 2, 1)  # (N, 9, 128)
+
+    y_path = root / split / f"y_{split}.txt"
+    y = np.loadtxt(y_path, dtype=int) - 1  # convert to 0-indexed
+
+    return X.astype(np.float32), y.astype(np.int64)
